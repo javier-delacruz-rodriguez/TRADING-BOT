@@ -13,7 +13,7 @@ class Config:
     API_KEY = os.getenv("BYBIT_API_KEY", "")
     API_SECRET = os.getenv("BYBIT_API_SECRET", "")
     SYMBOL = "BTCUSDT"
-    TIMEFRAME = "60"
+    TIMEFRAME = "15"  # CAMBIO 1: Velas de 15 min para entradas más frecuentes
     CAPITAL_SIMULADO = 10000.0
     RISK_PER_TRADE_PCT = 1.0
     MAX_ORDER_RETRIES = 5
@@ -97,7 +97,7 @@ class BotBybit:
         self.ws.orderbook_stream(depth=1, symbol=self.config.SYMBOL, callback=self.on_orderbook_message)
         self.ws.kline_stream(interval=self.config.TIMEFRAME, symbol=self.config.SYMBOL, callback=self.on_kline_message)
         
-        print(f"🚨 SISTEMA BYBIT INICIADO EN {self.config.SYMBOL} 🚨", flush=True)
+        print(f"🚨 SISTEMA BYBIT INICIADO EN {self.config.SYMBOL} (VELAS {self.config.TIMEFRAME}m) 🚨", flush=True)
         print("📡 Escuchando mercado en tiempo real...", flush=True)
         
         try:
@@ -245,7 +245,19 @@ class BotBybit:
         capital = self.obtener_balance_usdt()
         riesgo_usd = capital * (self.config.RISK_PER_TRADE_PCT / 100)
         distancia_sl = atr * self.config.ATR_MULTIPLIER_SL
+        
+        # Cálculo de tamaño de posición inicial
         cantidad = riesgo_usd / distancia_sl
+        
+        # CAMBIO 2: Límite de Capital en SPOT (Hard Cap)
+        precio_estimado = self.best_ask if self.best_ask > 0 else self.df.iloc[-1]['close']
+        coste_orden = cantidad * precio_estimado
+        limite_max_usd = capital * 0.95
+        
+        if coste_orden > limite_max_usd:
+            print(f"⚠️ Ajuste de capital: Orden original (${coste_orden:.2f}) supera el 95% del saldo disponible. Limitando cantidad a max capital (${limite_max_usd:.2f})", flush=True)
+            cantidad = limite_max_usd / precio_estimado
+
         llenado, precio_entrada = self.ejecutor_inteligente_maker('Buy', cantidad)
         if llenado:
             self.estado['posicion_abierta'] = True
