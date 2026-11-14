@@ -13,7 +13,7 @@ class Config:
     API_KEY = os.getenv("BYBIT_API_KEY", "")
     API_SECRET = os.getenv("BYBIT_API_SECRET", "")
     SYMBOL = "BTCUSDT"
-    TIMEFRAME = "15"  # CAMBIO 1: Velas de 15 min para entradas más frecuentes
+    TIMEFRAME = "15"
     CAPITAL_SIMULADO = 10000.0
     RISK_PER_TRADE_PCT = 1.0
     MAX_ORDER_RETRIES = 5
@@ -76,6 +76,7 @@ class BotBybit:
         self.capital_actual = config.CAPITAL_SIMULADO
         self.step_size = 0.00001
         self.tick_size = 0.01
+        self.min_order_amt = 1.0  # Mínimo en USDT de seguridad
         self.best_bid = 0.0 
         self.best_ask = 0.0 
         self.ultimo_mensaje = time.time()
@@ -118,25 +119,23 @@ class BotBybit:
                 info = lista[0]
                 self.step_size = float(info['lotSizeFilter']['basePrecision'])
                 self.tick_size = float(info['priceFilter']['tickSize'])
-                print(f"📏 Filtros API cargados: Step={self.step_size}, Tick={self.tick_size}", flush=True)
+                if 'minOrderAmt' in info.get('lotSizeFilter', {}):
+                    self.min_order_amt = float(info['lotSizeFilter']['minOrderAmt'])
+                print(f"📏 Filtros API cargados: Step={self.step_size}, Tick={self.tick_size}, MinAmt={self.min_order_amt}", flush=True)
             else:
-                print("⚠️ Sin filtros desde API. Usando predeterminados BTCUSDT (0.00001 / 0.01).", flush=True)
-                self.step_size = 0.00001
-                self.tick_size = 0.01
+                print("⚠️ Sin filtros desde API. Usando predeterminados.", flush=True)
         except Exception as e:
             print(f"⚠️ Error al obtener filtros de API ({e}). Usando predeterminados.", flush=True)
-            self.step_size = 0.00001
-            self.tick_size = 0.01
 
     def ajustar_cantidad(self, cantidad: float) -> str:
-        cant_truncada = math.floor(cantidad / self.step_size) * self.step_size
         precision = int(round(-math.log(self.step_size, 10), 0)) if self.step_size < 1 else 0
-        return "{:0.0{}f}".format(cant_truncada, precision)
+        cant_truncada = math.floor(cantidad / self.step_size) * self.step_size
+        return f"{cant_truncada:.{precision}f}"
 
     def ajustar_precio(self, precio: float) -> str:
-        precio_truncado = math.floor(precio / self.tick_size) * self.tick_size
         precision = int(round(-math.log(self.tick_size, 10), 0)) if self.tick_size < 1 else 0
-        return "{:0.0{}f}".format(precio_truncado, precision)
+        precio_truncado = round(math.floor(precio / self.tick_size) * self.tick_size, precision)
+        return f"{precio_truncado:.{precision}f}"
 
     def cargar_historial(self):
         try:
@@ -210,16 +209,21 @@ class BotBybit:
                     )
                     order_id = res['result']['orderId']
                     time.sleep(self.config.ORDER_TIMEOUT_SEC)
-                    status_res = self.session.get_order_history(category="spot", symbol=self.config.SYMBOL, orderId=order_id)
-                    status = status_res['result']['list'][0]['orderStatus']
                     
-                    if status == 'Filled':
-                        llenado = True
-                        precio_ejecutado = float(status_res['result']['list'][0]['avgPrice'])
-                        print(f"   ✅ ¡Orden LLENADA a ${precio_ejecutado:.2f}!", flush=True)
-                    elif status in ['New', 'PartiallyFilled']:
-                        print("   ⏳ Precio escapó. Cancelando...", flush=True)
-                        self.session.cancel_order(category="spot", symbol=self.config.SYMBOL, orderId=order_id)
+                    status_res = self.session.get_order_history(category="spot", symbol=self.config.SYMBOL, orderId=order_id)
+                    lista_historial = status_res.get('result', {}).get('list', [])
+                    
+                    if lista_historial:
+                        status = lista_historial[0]['orderStatus']
+                        if status == 'Filled':
+                            llenado = True
+                            precio_ejecutado = float(lista_historial[0]['avgPrice'])
+                            print(f"   ✅ ¡Orden LLENADA a ${precio_ejecutado:.2f}!", flush=True)
+                        elif status in ['New', 'PartiallyFilled']:
+                            print("   ⏳ Precio escapó. Cancelando...", flush=True)
+                            self.session.cancel_order(category="spot", symbol=self.config.SYMBOL, orderId=order_id)
+                    else:
+                        print("   ⚠️ Respuesta vacía al consultar orden. Reintentando...", flush=True)
                 except Exception as e:
                     print(f"   ❌ Error Bybit API: {e}", flush=True)
                     break
@@ -246,16 +250,20 @@ class BotBybit:
         riesgo_usd = capital * (self.config.RISK_PER_TRADE_PCT / 100)
         distancia_sl = atr * self.config.ATR_MULTIPLIER_SL
         
-        # Cálculo de tamaño de posición inicial
         cantidad = riesgo_usd / distancia_sl
-        
-        # CAMBIO 2: Límite de Capital en SPOT (Hard Cap)
         precio_estimado = self.best_ask if self.best_ask > 0 else self.df.iloc[-1]['close']
         coste_orden = cantidad * precio_estimado
-        limite_max_usd = capital * 0.95
         
+        # Validar mínimo nocional de Bybit (mínimo 5 USDT para evitar rechazos de límite inferior)
+        min_requerido = max(self.min_order_amt, 5.0)
+        if coste_orden < min_requerido:
+            print(f"⚠️ Orden calculada (${coste_orden:.2f}) es menor que el mínimo de Bybit. Ajustando al mínimo de ${min_requerido} USDT.", flush=True)
+            cantidad = min_requerido / precio_estimado
+            coste_orden = min_requerido
+
+        limite_max_usd = capital * 0.95
         if coste_orden > limite_max_usd:
-            print(f"⚠️ Ajuste de capital: Orden original (${coste_orden:.2f}) supera el 95% del saldo disponible. Limitando cantidad a max capital (${limite_max_usd:.2f})", flush=True)
+            print(f"⚠️ Ajuste de capital: Orden original (${coste_orden:.2f}) supera el 95% del saldo disponible. Limitando a max capital (${limite_max_usd:.2f})", flush=True)
             cantidad = limite_max_usd / precio_estimado
 
         llenado, precio_entrada = self.ejecutor_inteligente_maker('Buy', cantidad)
