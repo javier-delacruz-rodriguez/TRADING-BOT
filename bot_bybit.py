@@ -16,14 +16,21 @@ class Config:
     TIMEFRAME = "15"
     CAPITAL_SIMULADO = 10000.0
     RISK_PER_TRADE_PCT = 1.0
-    MAX_ORDER_RETRIES = 5
+    MAX_ORDER_RETRIES = 3
     ORDER_TIMEOUT_SEC = 10
     SMA_FAST = 9
     SMA_SLOW = 21
     ATR_PERIOD = 14
     ADX_PERIOD = 14
-    ATR_MULTIPLIER_SL = 2.0  
-    ATR_MULTIPLIER_TP = 4.0  
+    ATR_MULTIPLIER_SL = 2.0
+    ATR_MULTIPLIER_TP = 4.0
+
+    # Controles de capital y operativa Spot
+    ALLOW_BUY_ORDERS = True           # Activado para operar automáticamente
+    MAX_CAPITAL_USE_PCT = 95.0        # Máximo % del saldo USDT disponible por orden
+    MIN_ORDER_USDT = 5.5              # Mínimo seguro en USDT para evitar error 170140 y comisiones altas
+    COOLDOWN_AFTER_REJECT_SEC = 900   # 15 min de pausa si una orden es rechazada
+
     DRY_RUN = False
     LOG_LEVEL = logging.INFO
 
@@ -44,17 +51,17 @@ class IndicadoresAvanzados:
         high, low = df['high'], df['low']
         up_move = high - high.shift(1)
         down_move = low.shift(1) - low
-        
+
         pos_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
         neg_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
-        
+
         tr_smooth = IndicadoresAvanzados.calcular_atr(df, periodo)
         pos_dm_smooth = pos_dm.ewm(alpha=1/periodo, adjust=False).mean()
         neg_dm_smooth = neg_dm.ewm(alpha=1/periodo, adjust=False).mean()
-        
+
         pos_di = 100 * (pos_dm_smooth / tr_smooth)
         neg_di = 100 * (neg_dm_smooth / tr_smooth)
-        
+
         dx = 100 * (pos_di - neg_di).abs() / (pos_di + neg_di)
         adx = dx.ewm(alpha=1/periodo, adjust=False).mean()
         return pd.DataFrame({'ADX': adx, 'MACD_Hist': IndicadoresAvanzados.calcular_macd_hist(df)})
@@ -76,10 +83,11 @@ class BotBybit:
         self.capital_actual = config.CAPITAL_SIMULADO
         self.step_size = 0.00001
         self.tick_size = 0.01
-        self.min_order_amt = 1.0  # Mínimo en USDT de seguridad
-        self.best_bid = 0.0 
-        self.best_ask = 0.0 
+        self.min_order_amt = config.MIN_ORDER_USDT
+        self.best_bid = 0.0
+        self.best_ask = 0.0
         self.ultimo_mensaje = time.time()
+        self.bloqueado_hasta = 0.0
         self.estado = {
             "posicion_abierta": False,
             "precio_entrada": 0.0,
@@ -97,10 +105,10 @@ class BotBybit:
         print("🔹 Conectando WebSockets...", flush=True)
         self.ws.orderbook_stream(depth=1, symbol=self.config.SYMBOL, callback=self.on_orderbook_message)
         self.ws.kline_stream(interval=self.config.TIMEFRAME, symbol=self.config.SYMBOL, callback=self.on_kline_message)
-        
-        print(f"🚨 SISTEMA BYBIT INICIADO EN {self.config.SYMBOL} (VELAS {self.config.TIMEFRAME}m) 🚨", flush=True)
+
+        print(f"🚨 SISTEMA BYBIT INICIADO EN {self.config.SYMBOL} (VELAS {self.config.TIMEFRAME}m | COMPRAS={self.config.ALLOW_BUY_ORDERS}) 🚨", flush=True)
         print("📡 Escuchando mercado en tiempo real...", flush=True)
-        
+
         try:
             while True:
                 time.sleep(10)
@@ -120,7 +128,8 @@ class BotBybit:
                 self.step_size = float(info['lotSizeFilter']['basePrecision'])
                 self.tick_size = float(info['priceFilter']['tickSize'])
                 if 'minOrderAmt' in info.get('lotSizeFilter', {}):
-                    self.min_order_amt = float(info['lotSizeFilter']['minOrderAmt'])
+                    api_min = float(info['lotSizeFilter']['minOrderAmt'])
+                    self.min_order_amt = max(self.config.MIN_ORDER_USDT, api_min)
                 print(f"📏 Filtros API cargados: Step={self.step_size}, Tick={self.tick_size}, MinAmt={self.min_order_amt}", flush=True)
             else:
                 print("⚠️ Sin filtros desde API. Usando predeterminados.", flush=True)
@@ -162,15 +171,24 @@ class BotBybit:
         self.df['MACD_Hist'] = adx_df['MACD_Hist']
 
     def obtener_balance_usdt(self) -> float:
-        if self.config.DRY_RUN: return self.capital_actual
-        res = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-        return float(res['result']['list'][0]['coin'][0]['walletBalance'])
+        if self.config.DRY_RUN:
+            return self.capital_actual
+        try:
+            res = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            coins = res.get('result', {}).get('list', [{}])[0].get('coin', [])
+            if coins:
+                return float(coins[0].get('walletBalance', 0.0))
+        except Exception as e:
+            print(f"⚠️ Error al consultar balance USDT: {e}", flush=True)
+        return 0.0
 
     def on_orderbook_message(self, message):
         self.ultimo_mensaje = time.time()
         data = message.get('data', {})
-        if 'b' in data and data['b']: self.best_bid = float(data['b'][0][0])
-        if 'a' in data and data['a']: self.best_ask = float(data['a'][0][0])
+        if 'b' in data and data['b']:
+            self.best_bid = float(data['b'][0][0])
+        if 'a' in data and data['a']:
+            self.best_ask = float(data['a'][0][0])
         self.vigilar_riesgo()
 
     def on_kline_message(self, message):
@@ -198,21 +216,23 @@ class BotBybit:
         while intentos < self.config.MAX_ORDER_RETRIES and not llenado:
             intentos += 1
             precio_limite_raw = self.best_bid if lado == 'Buy' else self.best_ask
+            if precio_limite_raw <= 0:
+                break
             precio_limite_str = self.ajustar_precio(precio_limite_raw)
             print(f"⚙️ MARKET MAKER: {lado} {cantidad_str} a ${precio_limite_str}", flush=True)
 
             if not self.config.DRY_RUN:
                 try:
                     res = self.session.place_order(
-                        category="spot", symbol=self.config.SYMBOL, side=lado, 
+                        category="spot", symbol=self.config.SYMBOL, side=lado,
                         orderType="Limit", qty=cantidad_str, price=precio_limite_str, timeInForce="GTC"
                     )
                     order_id = res['result']['orderId']
                     time.sleep(self.config.ORDER_TIMEOUT_SEC)
-                    
+
                     status_res = self.session.get_order_history(category="spot", symbol=self.config.SYMBOL, orderId=order_id)
                     lista_historial = status_res.get('result', {}).get('list', [])
-                    
+
                     if lista_historial:
                         status = lista_historial[0]['orderStatus']
                         if status == 'Filled':
@@ -226,6 +246,7 @@ class BotBybit:
                         print("   ⚠️ Respuesta vacía al consultar orden. Reintentando...", flush=True)
                 except Exception as e:
                     print(f"   ❌ Error Bybit API: {e}", flush=True)
+                    self.bloqueado_hasta = time.time() + self.config.COOLDOWN_AFTER_REJECT_SEC
                     break
             else:
                 time.sleep(2)
@@ -237,51 +258,75 @@ class BotBybit:
         return llenado, precio_ejecutado
 
     def evaluar_estrategia(self):
-        if len(self.df) < 50 or self.estado['orden_en_curso']: return
+        if len(self.df) < 50 or self.estado['orden_en_curso']:
+            return
+        if time.time() < self.bloqueado_hasta:
+            return
         vela, vela_prev = self.df.iloc[-1], self.df.iloc[-2]
         if vela['ADX'] > 25 and not self.estado['posicion_abierta']:
             cruce_alcista = vela_prev['SMA_F'] <= vela_prev['SMA_S'] and vela['SMA_F'] > vela['SMA_S']
             if cruce_alcista and vela['MACD_Hist'] > 0:
+                if not self.config.ALLOW_BUY_ORDERS:
+                    print("⏸️ Señal detectada, pero ALLOW_BUY_ORDERS=False (no se gasta USDT en comprar BTC).", flush=True)
+                    return
                 print("📈 SEÑAL DE COMPRA CONFIRMADA.", flush=True)
                 self.lanzar_compra_estrategica(vela['ATR'])
 
     def lanzar_compra_estrategica(self, atr: float):
         capital = self.obtener_balance_usdt()
-        riesgo_usd = capital * (self.config.RISK_PER_TRADE_PCT / 100)
-        distancia_sl = atr * self.config.ATR_MULTIPLIER_SL
-        
-        cantidad = riesgo_usd / distancia_sl
-        precio_estimado = self.best_ask if self.best_ask > 0 else self.df.iloc[-1]['close']
-        coste_orden = cantidad * precio_estimado
-        
-        # Validar mínimo nocional de Bybit (mínimo 5 USDT para evitar rechazos de límite inferior)
-        min_requerido = max(self.min_order_amt, 5.0)
-        if coste_orden < min_requerido:
-            print(f"⚠️ Orden calculada (${coste_orden:.2f}) es menor que el mínimo de Bybit. Ajustando al mínimo de ${min_requerido} USDT.", flush=True)
-            cantidad = min_requerido / precio_estimado
-            coste_orden = min_requerido
+        limite_max_usd = capital * (self.config.MAX_CAPITAL_USE_PCT / 100.0)
 
-        limite_max_usd = capital * 0.95
+        if limite_max_usd < self.min_order_amt:
+            print(
+                f"⛔ Saldo USDT insuficiente para operar (${capital:.2f} USDT; máx usable ${limite_max_usd:.2f} < mínimo ${self.min_order_amt:.2f}). "
+                f"Pausa de {self.config.COOLDOWN_AFTER_REJECT_SEC // 60} min.",
+                flush=True
+            )
+            self.bloqueado_hasta = time.time() + self.config.COOLDOWN_AFTER_REJECT_SEC
+            return
+
+        if atr <= 0:
+            return
+
+        riesgo_usd = capital * (self.config.RISK_PER_TRADE_PCT / 100.0)
+        distancia_sl = atr * self.config.ATR_MULTIPLIER_SL
+        cantidad = riesgo_usd / distancia_sl
+
+        precio_estimado = self.best_ask if self.best_ask > 0 else float(self.df.iloc[-1]['close'])
+        coste_orden = cantidad * precio_estimado
+
+        if coste_orden < self.min_order_amt:
+            cantidad = self.min_order_amt / precio_estimado
+            coste_orden = self.min_order_amt
+
         if coste_orden > limite_max_usd:
-            print(f"⚠️ Ajuste de capital: Orden original (${coste_orden:.2f}) supera el 95% del saldo disponible. Limitando a max capital (${limite_max_usd:.2f})", flush=True)
             cantidad = limite_max_usd / precio_estimado
 
-        llenado, precio_entrada = self.ejecutor_inteligente_maker('Buy', cantidad)
+        cantidad_str = self.ajustar_cantidad(cantidad)
+        valor_final_usd = float(cantidad_str) * precio_estimado
+        if float(cantidad_str) <= 0 or valor_final_usd < self.min_order_amt:
+            print(f"⛔ Cantidad ajustada (${valor_final_usd:.2f}) por debajo del mínimo (${self.min_order_amt:.2f}). Evitando error 170140.", flush=True)
+            self.bloqueado_hasta = time.time() + self.config.COOLDOWN_AFTER_REJECT_SEC
+            return
+
+        llenado, precio_entrada = self.ejecutor_inteligente_maker('Buy', float(cantidad_str))
         if llenado:
             self.estado['posicion_abierta'] = True
             self.estado['precio_entrada'] = precio_entrada
-            self.estado['cantidad_activos'] = float(self.ajustar_cantidad(cantidad))
+            self.estado['cantidad_activos'] = float(cantidad_str)
             self.estado['stop_loss'] = precio_entrada - distancia_sl
             self.estado['take_profit'] = precio_entrada + (atr * self.config.ATR_MULTIPLIER_TP)
-            if self.config.DRY_RUN: self.capital_actual -= (self.estado['cantidad_activos'] * precio_entrada)
+            if self.config.DRY_RUN:
+                self.capital_actual -= (self.estado['cantidad_activos'] * precio_entrada)
             print(f"🟩 POSICIÓN LONG ABIERTA | SL: ${self.estado['stop_loss']:.2f} | TP: ${self.estado['take_profit']:.2f}", flush=True)
 
     def vigilar_riesgo(self):
-        if not self.estado['posicion_abierta'] or self.estado['orden_en_curso']: return
-        if self.best_bid <= self.estado['stop_loss']:
+        if not self.estado['posicion_abierta'] or self.estado['orden_en_curso']:
+            return
+        if self.best_bid > 0 and self.best_bid <= self.estado['stop_loss']:
             print("💥 STOP LOSS ALCANZADO.", flush=True)
             self.cerrar_posicion('Sell', "Stop Loss")
-        elif self.best_bid >= self.estado['take_profit']:
+        elif self.best_bid > 0 and self.best_bid >= self.estado['take_profit']:
             print("🎉 TAKE PROFIT ALCANZADO.", flush=True)
             self.cerrar_posicion('Sell', "Take Profit")
 
@@ -289,7 +334,8 @@ class BotBybit:
         llenado, precio_salida = self.ejecutor_inteligente_maker(lado, self.estado['cantidad_activos'])
         if llenado:
             pnl = (precio_salida - self.estado['precio_entrada']) * self.estado['cantidad_activos']
-            if self.config.DRY_RUN: self.capital_actual += (self.estado['cantidad_activos'] * precio_salida)
+            if self.config.DRY_RUN:
+                self.capital_actual += (self.estado['cantidad_activos'] * precio_salida)
             print(f"⬛ POSICIÓN CERRADA ({razon}) | P&L: ${pnl:+.2f}", flush=True)
             self.estado['posicion_abierta'] = False
 
