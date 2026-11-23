@@ -31,6 +31,11 @@ class Config:
     MIN_ORDER_USDT = 5.5              # Mínimo seguro en USDT para evitar error 170140 y comisiones altas
     COOLDOWN_AFTER_REJECT_SEC = 900   # 15 min de pausa si una orden es rechazada
 
+    # Gestión de BTC pendiente y ventas no completadas
+    RECOVER_STUCK_BTC = True          # Lee saldo real de BTC y vende BTC sobrante/pendiente para liberar USDT
+    KEEP_BTC_RESERVE = 0.0            # Cantidad mínima de BTC a reservar sin vender (0.0 para vender todo lo vendible)
+    ALLOW_MARKET_SELL_FALLBACK = True # Si la venta Limit no se llena, ejecuta venta Market para no dejar BTC atascado
+
     DRY_RUN = False
     LOG_LEVEL = logging.INFO
 
@@ -81,6 +86,7 @@ class BotBybit:
         self.session = HTTP(testnet=False, tld="eu", api_key=self.config.API_KEY, api_secret=self.config.API_SECRET)
         self.ws = WebSocket(testnet=False, tld="eu", channel_type="spot")
         self.capital_actual = config.CAPITAL_SIMULADO
+        self.btc_simulado = 0.0
         self.step_size = 0.00001
         self.tick_size = 0.01
         self.min_order_amt = config.MIN_ORDER_USDT
@@ -170,17 +176,57 @@ class BotBybit:
         self.df['ADX'] = adx_df['ADX']
         self.df['MACD_Hist'] = adx_df['MACD_Hist']
 
-    def obtener_balance_usdt(self) -> float:
+    def obtener_balance_moneda(self, moneda: str) -> float:
         if self.config.DRY_RUN:
-            return self.capital_actual
+            return self.capital_actual if moneda == "USDT" else self.btc_simulado
         try:
-            res = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            res = self.session.get_wallet_balance(accountType="UNIFIED", coin=moneda)
             coins = res.get('result', {}).get('list', [{}])[0].get('coin', [])
             if coins:
-                return float(coins[0].get('walletBalance', 0.0))
+                coin_data = coins[0]
+                for campo in ('walletBalance', 'equity', 'usdValue'):
+                    if campo in coin_data and coin_data[campo] not in (None, ''):
+                        if campo == 'usdValue':
+                            precio_ref = self.best_bid if self.best_bid > 0 else (float(self.df.iloc[-1]['close']) if len(self.df) > 0 else 0.0)
+                            return float(coin_data[campo]) / precio_ref if precio_ref > 0 else 0.0
+                        return float(coin_data[campo])
         except Exception as e:
-            print(f"⚠️ Error al consultar balance USDT: {e}", flush=True)
+            print(f"⚠️ Error al consultar balance {moneda}: {e}", flush=True)
         return 0.0
+
+    def obtener_balance_usdt(self) -> float:
+        return self.obtener_balance_moneda("USDT")
+
+    def obtener_balance_btc(self) -> float:
+        return self.obtener_balance_moneda("BTC")
+
+    def ejecutar_venta_market_respaldo(self, cantidad_str: str):
+        precio_ref = self.best_bid if self.best_bid > 0 else (float(self.df.iloc[-1]['close']) if len(self.df) > 0 else 0.0)
+        print(f"⚡ RESCATE VENTA MARKET: Sell {cantidad_str} BTC (~${float(cantidad_str) * precio_ref:.2f})", flush=True)
+        if not self.config.DRY_RUN:
+            try:
+                res = self.session.place_order(
+                    category="spot", symbol=self.config.SYMBOL, side="Sell",
+                    orderType="Market", qty=cantidad_str
+                )
+                order_id = res.get('result', {}).get('orderId')
+                time.sleep(2)
+                if order_id:
+                    status_res = self.session.get_order_history(category="spot", symbol=self.config.SYMBOL, orderId=order_id)
+                    lista_historial = status_res.get('result', {}).get('list', [])
+                    if lista_historial and float(lista_historial[0].get('avgPrice') or 0) > 0:
+                        precio_ejecutado = float(lista_historial[0]['avgPrice'])
+                        print(f"   ✅ ¡Venta Market completada a ${precio_ejecutado:.2f}!", flush=True)
+                        return True, precio_ejecutado
+                print("   ✅ ¡Venta Market enviada y procesada!", flush=True)
+                return True, precio_ref
+            except Exception as e:
+                print(f"   ❌ Error en venta Market Bybit API: {e}", flush=True)
+                return False, 0.0
+        else:
+            time.sleep(1)
+            print(f"   ✅ [SIMULADOR] Venta Market simulada a ${precio_ref:.2f}", flush=True)
+            return True, precio_ref
 
     def on_orderbook_message(self, message):
         self.ultimo_mensaje = time.time()
@@ -246,7 +292,8 @@ class BotBybit:
                         print("   ⚠️ Respuesta vacía al consultar orden. Reintentando...", flush=True)
                 except Exception as e:
                     print(f"   ❌ Error Bybit API: {e}", flush=True)
-                    self.bloqueado_hasta = time.time() + self.config.COOLDOWN_AFTER_REJECT_SEC
+                    if lado == 'Buy':
+                        self.bloqueado_hasta = time.time() + self.config.COOLDOWN_AFTER_REJECT_SEC
                     break
             else:
                 time.sleep(2)
@@ -254,12 +301,47 @@ class BotBybit:
                 precio_ejecutado = float(precio_limite_str)
                 print(f"   ✅ [SIMULADOR] Orden {lado} simulada a ${precio_ejecutado:.2f}", flush=True)
 
+        # Si es venta y no se completó por límite, usar respaldo Market para no dejar BTC atascado
+        if lado == 'Sell' and not llenado and self.config.ALLOW_MARKET_SELL_FALLBACK:
+            llenado, precio_ejecutado = self.ejecutar_venta_market_respaldo(cantidad_str)
+
         self.estado['orden_en_curso'] = False
         return llenado, precio_ejecutado
+
+    def intentar_vender_btc_pendiente(self) -> bool:
+        if not self.config.RECOVER_STUCK_BTC or self.estado['orden_en_curso'] or self.estado['posicion_abierta']:
+            return False
+
+        btc_total = self.obtener_balance_btc()
+        btc_vendible = max(0.0, btc_total - self.config.KEEP_BTC_RESERVE)
+        qty_str = self.ajustar_cantidad(btc_vendible)
+        qty_float = float(qty_str)
+
+        if qty_float <= 0:
+            return False
+
+        precio_ref = self.best_bid if self.best_bid > 0 else (float(self.df.iloc[-1]['close']) if len(self.df) > 0 else 0.0)
+        valor_usd = qty_float * precio_ref
+        if precio_ref <= 0 or valor_usd < self.min_order_amt:
+            return False
+
+        print(f"🔄 Detectado saldo BTC pendiente ({qty_float} BTC ≈ ${valor_usd:.2f}). Vendiendo para liberar USDT...", flush=True)
+        llenado, precio_salida = self.ejecutor_inteligente_maker('Sell', qty_float)
+        if llenado:
+            if self.config.DRY_RUN:
+                self.btc_simulado = max(0.0, self.btc_simulado - qty_float)
+                self.capital_actual += (qty_float * precio_salida)
+            print(f"💵 BTC pendiente vendido a ${precio_salida:.2f}. Saldo USDT actualizado.", flush=True)
+            return True
+        return False
 
     def evaluar_estrategia(self):
         if len(self.df) < 50 or self.estado['orden_en_curso']:
             return
+
+        # Revisa si quedó BTC sin vender tras una operación incompleta o reinicio
+        self.intentar_vender_btc_pendiente()
+
         if time.time() < self.bloqueado_hasta:
             return
         vela, vela_prev = self.df.iloc[-1], self.df.iloc[-2]
@@ -311,13 +393,15 @@ class BotBybit:
 
         llenado, precio_entrada = self.ejecutor_inteligente_maker('Buy', float(cantidad_str))
         if llenado:
+            cant_real = float(cantidad_str)
             self.estado['posicion_abierta'] = True
             self.estado['precio_entrada'] = precio_entrada
-            self.estado['cantidad_activos'] = float(cantidad_str)
+            self.estado['cantidad_activos'] = cant_real
             self.estado['stop_loss'] = precio_entrada - distancia_sl
             self.estado['take_profit'] = precio_entrada + (atr * self.config.ATR_MULTIPLIER_TP)
             if self.config.DRY_RUN:
-                self.capital_actual -= (self.estado['cantidad_activos'] * precio_entrada)
+                self.btc_simulado += cant_real
+                self.capital_actual -= (cant_real * precio_entrada)
             print(f"🟩 POSICIÓN LONG ABIERTA | SL: ${self.estado['stop_loss']:.2f} | TP: ${self.estado['take_profit']:.2f}", flush=True)
 
     def vigilar_riesgo(self):
@@ -331,13 +415,20 @@ class BotBybit:
             self.cerrar_posicion('Sell', "Take Profit")
 
     def cerrar_posicion(self, lado: str, razon: str):
-        llenado, precio_salida = self.ejecutor_inteligente_maker(lado, self.estado['cantidad_activos'])
+        saldo_btc_real = self.obtener_balance_btc()
+        cantidad_a_vender = min(self.estado['cantidad_activos'], saldo_btc_real) if saldo_btc_real > 0 else self.estado['cantidad_activos']
+        if cantidad_a_vender <= 0 and saldo_btc_real > 0:
+            cantidad_a_vender = saldo_btc_real
+
+        llenado, precio_salida = self.ejecutor_inteligente_maker(lado, cantidad_a_vender)
         if llenado:
-            pnl = (precio_salida - self.estado['precio_entrada']) * self.estado['cantidad_activos']
+            pnl = (precio_salida - self.estado['precio_entrada']) * cantidad_a_vender
             if self.config.DRY_RUN:
-                self.capital_actual += (self.estado['cantidad_activos'] * precio_salida)
+                self.btc_simulado = max(0.0, self.btc_simulado - cantidad_a_vender)
+                self.capital_actual += (cantidad_a_vender * precio_salida)
             print(f"⬛ POSICIÓN CERRADA ({razon}) | P&L: ${pnl:+.2f}", flush=True)
             self.estado['posicion_abierta'] = False
+            self.estado['cantidad_activos'] = 0.0
 
 if __name__ == "__main__":
     bot = BotBybit(Config())
