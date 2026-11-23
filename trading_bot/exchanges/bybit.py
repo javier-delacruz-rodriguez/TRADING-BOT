@@ -70,7 +70,14 @@ class BybitExchange(Exchange):
 
     # ---- mercado ----
     def cargar_filtros(self) -> Filtros:
-        info = self._publico("get_instruments_info", category="spot", symbol=self.symbol)
+        info = self._lista(self.http.get_instruments_info(category="spot", symbol=self.symbol))
+        if not info and not self.cfg.dry_run:
+            # En real, el símbolo tiene que existir donde se envían las órdenes.
+            raise ErrorExchange(f"El símbolo {self.symbol} no se puede operar en este endpoint de Bybit "
+                                f"({self.cfg.bybit_tld or 'global'}). En Bybit EU usa pares en USDC o EUR, "
+                                f"p.ej. SYMBOL=BTCUSDC.")
+        if not info:
+            info = self._publico("get_instruments_info", category="spot", symbol=self.symbol)
         if not info:
             raise ErrorExchange(f"El símbolo {self.symbol} no existe en Bybit spot. Revisa SYMBOL en el .env "
                                 f"(en Bybit EU suelen operarse pares en USDC o EUR, p.ej. BTCUSDC).")

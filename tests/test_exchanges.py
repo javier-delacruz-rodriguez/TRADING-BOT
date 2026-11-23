@@ -33,3 +33,14 @@ def test_bybit_simbolo_inexistente_mensaje_claro(monkeypatch):
         raise AssertionError("debía fallar")
     except modulo_bybit.ErrorExchange as e:
         assert "SYMBOL" in str(e)
+
+
+def test_bybit_real_no_usa_respaldo_para_el_simbolo(monkeypatch):
+    monkeypatch.setattr(modulo_bybit, "HTTP", falso_http({"eu": VACIO, "global": INFO}))
+    cfg = Config(exchange="bybit", bybit_tld="eu", dry_run=False, api_key="k", api_secret="s")
+    ex = modulo_bybit.BybitExchange(cfg)
+    try:
+        ex.cargar_filtros()
+        raise AssertionError("debía fallar en modo real")
+    except modulo_bybit.ErrorExchange as e:
+        assert "BTCUSDC" in str(e)
