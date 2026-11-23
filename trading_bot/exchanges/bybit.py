@@ -48,16 +48,32 @@ class BybitExchange(Exchange):
         if not cfg.testnet and cfg.bybit_tld:
             kwargs["tld"] = cfg.bybit_tld
         self.http = HTTP(**kwargs)
+        # Algunos endpoints públicos de Bybit EU devuelven listas vacías; los datos de
+        # mercado (no las órdenes ni el saldo) se piden entonces al endpoint global.
+        self.http_publico = HTTP(testnet=cfg.testnet) if "tld" in kwargs else None
+        self._aviso_publico = False
         self.ws: Optional[WebSocket] = None
 
     def _lista(self, respuesta) -> list:
         return (respuesta or {}).get("result", {}).get("list", []) or []
 
+    def _publico(self, metodo: str, **params) -> list:
+        """Datos de mercado: endpoint configurado y, si viene vacío, el global."""
+        lista = self._lista(getattr(self.http, metodo)(**params))
+        if not lista and self.http_publico is not None:
+            if not self._aviso_publico:
+                logger.warning("Bybit %s devolvió datos vacíos para %s en %s; usando el endpoint público global.",
+                               self.cfg.bybit_tld.upper(), self.symbol, metodo)
+                self._aviso_publico = True
+            lista = self._lista(getattr(self.http_publico, metodo)(**params))
+        return lista
+
     # ---- mercado ----
     def cargar_filtros(self) -> Filtros:
-        info = self._lista(self.http.get_instruments_info(category="spot", symbol=self.symbol))
+        info = self._publico("get_instruments_info", category="spot", symbol=self.symbol)
         if not info:
-            raise ErrorExchange(f"Bybit no devolvió información del símbolo {self.symbol}")
+            raise ErrorExchange(f"El símbolo {self.symbol} no existe en Bybit spot. Revisa SYMBOL en el .env "
+                                f"(en Bybit EU suelen operarse pares en USDC o EUR, p.ej. BTCUSDC).")
         info = info[0]
         self.activo_base, self.activo_cotizado = info["baseCoin"], info["quoteCoin"]
         lot, price = info.get("lotSizeFilter", {}), info.get("priceFilter", {})
@@ -69,12 +85,12 @@ class BybitExchange(Exchange):
         )
 
     def obtener_velas(self, limite: int) -> pd.DataFrame:
-        res = self.http.get_kline(category="spot", symbol=self.symbol, interval=self.intervalo,
-                                  limit=min(limite + 1, 1000))
+        velas = self._publico("get_kline", category="spot", symbol=self.symbol, interval=self.intervalo,
+                              limit=min(limite + 1, 1000))
         ahora_ms = time.time() * 1000
         duracion_ms = self.cfg.timeframe_min * 60_000
         # Bybit devuelve de más reciente a más antigua e incluye la vela aún abierta: se descarta.
-        filas = [fila_vela(*v[:6]) for v in reversed(self._lista(res)) if float(v[0]) + duracion_ms <= ahora_ms]
+        filas = [fila_vela(*v[:6]) for v in reversed(velas) if float(v[0]) + duracion_ms <= ahora_ms]
         return pd.DataFrame(filas, columns=COLUMNAS_OHLCV).tail(limite).reset_index(drop=True)
 
     # ---- cuenta ----
