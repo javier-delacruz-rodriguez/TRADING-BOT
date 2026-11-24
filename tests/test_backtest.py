@@ -21,3 +21,19 @@ def test_backtest_resultado_coherente(cfg):
 def test_backtest_detecta_operacion(cfg):
     res = backtest(velas_con_cruce(), cfg)
     assert len(res.operaciones) >= 1
+
+
+def test_comparar_variantes(cfg):
+    from backtest import VARIANTES, comparar
+    tabla = comparar(velas_con_cruce(400), cfg, 1000)
+    for nombre in VARIANTES:
+        assert nombre in tabla
+
+
+def test_filtro_di_no_compra_en_tendencia_bajista(cfg):
+    from dataclasses import replace
+
+    from trading_bot import estrategia
+    df = estrategia.calcular_indicadores(velas_con_cruce(), replace(cfg, filtro_di=True))
+    senales = estrategia.serie_senales(df, replace(cfg, filtro_di=True))
+    assert (df.loc[senales, "DI_POS"] > df.loc[senales, "DI_NEG"]).all()

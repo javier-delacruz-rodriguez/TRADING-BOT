@@ -296,10 +296,10 @@ class Bot:
                 return
 
         if bid <= pos.stop_loss:
-            logger.warning("💥 STOP LOSS ALCANZADO (bid %s ≤ %s).", a_texto(bid), a_texto(pos.stop_loss))
+            logger.warning("💥 STOP LOSS ALCANZADO (bid %s ≤ %.2f).", a_texto(bid), pos.stop_loss)
             self.cerrar_posicion("Stop Loss", a_mercado=self.cfg.sl_a_mercado)
         elif bid >= pos.take_profit:
-            logger.info("🎉 TAKE PROFIT ALCANZADO (bid %s ≥ %s).", a_texto(bid), a_texto(pos.take_profit))
+            logger.info("🎉 TAKE PROFIT ALCANZADO (bid %s ≥ %.2f).", a_texto(bid), pos.take_profit)
             self.cerrar_posicion("Take Profit", a_mercado=False)
 
     def _cierre_por_stop_exchange(self, pos: Posicion) -> None:

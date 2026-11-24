@@ -70,9 +70,12 @@ class Config:
     atr_period: int = 14
     adx_period: int = 14
     adx_min: float = 25.0
+    filtro_di: bool = False
+    filtro_ema_tendencia: bool = False
+    ema_tendencia: int = 200
     atr_multiplier_sl: float = 2.0
     atr_multiplier_tp: float = 4.0
-    velas_historial: int = 300
+    velas_historial: int = 900
     velas_minimas: int = 100
 
     # Infraestructura
@@ -124,9 +127,12 @@ class Config:
             atr_period=_int("ATR_PERIOD", 14),
             adx_period=_int("ADX_PERIOD", 14),
             adx_min=_float("ADX_MIN", 25.0),
+            filtro_di=_bool("FILTRO_DI", False),
+            filtro_ema_tendencia=_bool("FILTRO_EMA_TENDENCIA", False),
+            ema_tendencia=_int("EMA_TENDENCIA", 200),
             atr_multiplier_sl=_float("ATR_MULTIPLIER_SL", 2.0),
             atr_multiplier_tp=_float("ATR_MULTIPLIER_TP", 4.0),
-            velas_historial=_int("VELAS_HISTORIAL", 300),
+            velas_historial=_int("VELAS_HISTORIAL", 900),
             velas_minimas=_int("VELAS_MINIMAS", 100),
             watchdog_sec=_int("WATCHDOG_SEC", 300),
             estado_archivo=_str("ESTADO_ARCHIVO", f"estado_{ex}{sufijo}.json"),

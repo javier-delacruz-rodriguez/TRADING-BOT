@@ -13,7 +13,7 @@ Supuestos (conservadores):
 import argparse
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List
 
 import pandas as pd
@@ -127,6 +127,33 @@ def backtest(velas: pd.DataFrame, cfg: Config, capital: float = 10000.0, desliza
     return res
 
 
+VARIANTES = {
+    "actual": {},
+    "+DI": {"filtro_di": True},
+    "+EMA200": {"filtro_ema_tendencia": True},
+    "+DI +EMA200": {"filtro_di": True, "filtro_ema_tendencia": True},
+    "+DI +EMA200 SL1.5/TP3": {"filtro_di": True, "filtro_ema_tendencia": True,
+                              "atr_multiplier_sl": 1.5, "atr_multiplier_tp": 3.0},
+    "+DI +EMA200 SL3/TP6": {"filtro_di": True, "filtro_ema_tendencia": True,
+                            "atr_multiplier_sl": 3.0, "atr_multiplier_tp": 6.0},
+}
+
+
+def comparar(velas: pd.DataFrame, base: Config, capital: float) -> str:
+    """Compara variantes en el periodo completo y en cada mitad (para ver si el resultado es estable)."""
+    mitad = len(velas) // 2
+    tramos = {"total": velas, "1ª mitad": velas.iloc[:mitad], "2ª mitad": velas.iloc[mitad:]}
+    filas = [f"{'variante':<24}{'tramo':<10}{'ops':>5}{'win%':>7}{'PF':>6}{'retorno%':>10}{'maxDD%':>9}"]
+    for nombre, cambios in VARIANTES.items():
+        cfg = replace(base, **cambios)
+        for tramo, datos in tramos.items():
+            r = backtest(datos.reset_index(drop=True), cfg, capital=capital)
+            filas.append(f"{nombre:<24}{tramo:<10}{len(r.operaciones):>5}{r.win_rate:>7.1f}"
+                         f"{min(r.profit_factor, 99):>6.2f}{r.retorno_pct:>10.2f}{r.max_drawdown_pct:>9.2f}")
+        filas.append("")
+    return "\n".join(filas)
+
+
 def descargar_bybit(symbol: str, timeframe_min: int, dias: int) -> pd.DataFrame:
     from pybit.unified_trading import HTTP
 
@@ -160,6 +187,7 @@ def main() -> int:
     p.add_argument("--comision", type=float, default=0.1, help="comisión por lado en %%")
     p.add_argument("--guardar", help="guardar las velas descargadas en este CSV")
     p.add_argument("--operaciones", help="guardar el detalle de operaciones en este CSV")
+    p.add_argument("--comparar", action="store_true", help="comparar la estrategia actual con variantes")
     a = p.parse_args()
 
     if a.csv:
@@ -173,8 +201,11 @@ def main() -> int:
         return 2
 
     cfg = Config(symbol=a.symbol, timeframe_min=a.timeframe, comision_pct=a.comision)
-    res = backtest(velas, cfg, capital=a.capital)
     print(f"Velas: {len(velas)} ({velas['timestamp'].iloc[0]} → {velas['timestamp'].iloc[-1]})")
+    if a.comparar:
+        print(comparar(velas, cfg, a.capital))
+        return 0
+    res = backtest(velas, cfg, capital=a.capital)
     print(res.resumen())
     if a.operaciones:
         pd.DataFrame([o.__dict__ for o in res.operaciones]).to_csv(a.operaciones, index=False)
