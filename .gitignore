@@ -3,11 +3,20 @@
 
 # Entorno virtual de Python
 venv/
+.venv/
 env/
 
 # Archivos temporales de Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 
-# Logs
+# Logs y datos generados por el bot
 *.log
+*.log.*
+estado_*.json
+estado_*.json.corrupto
+.estado_*.tmp
+operaciones_*.csv
+velas*.csv

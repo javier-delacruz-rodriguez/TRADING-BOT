@@ -1,0 +1,23 @@
+# Servicio systemd (alternativa recomendada a tmux).
+# Instalar:
+#   sudo cp deploy/trading-bot@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now trading-bot@bybit
+# Logs: journalctl -u trading-bot@bybit -f
+[Unit]
+Description=Trading bot (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TRADING-BOT
+ExecStart=/home/ubuntu/TRADING-BOT/venv/bin/python -u -m trading_bot.main --exchange %i
+Restart=on-failure
+RestartSec=10
+# No reintentar si la configuración es inválida (código 2)
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
